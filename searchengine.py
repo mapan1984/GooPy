@@ -45,14 +45,13 @@ class Crawler:
         urlid = self.get_entryid('urllist', 'url', url)
 
         # 将每个单词与该url关联
-        for i in range(len(words)):
-            word = words[i]
+        for loc,word in enumerate(words):
             if word in ignorewords:
                 continue
             wordid = self.get_entryid('wordlist', 'word', word)
             self.con.execute(
                     'insert into wordlocation(urlid, wordid, location) \
-                    values(%d, %d, %d)' % (urlid, wordid, i))
+                    values(%d, %d, %d)' % (urlid, wordid, loc))
 
     # 从一个HTML网页中提取文字(不带标签的)
     def get_text(self, soup):
@@ -85,7 +84,8 @@ class Crawler:
 
     # 添加一个关联两个网页的链接
     def add_linkref(self, urlFrom, urlTo, linkText):
-        pass
+        self.con.execute("insert into link(fromid, toid) values('%s', '%s')" \
+                                                            % (urlFrom, urlTo))
 
     # 从一小组网页开始进行广度优先搜索，直至某一给定深度
     # 期间为网页建立索引
@@ -98,7 +98,10 @@ class Crawler:
                 except:
                     print('Could not open %s' % page)
                     continue
-                soup = BeautifulSoup(c.read(), 'html.parser')
+                try:
+                    soup = BeautifulSoup(c.read(), 'html.parser')
+                except:
+                    print('Could not read %s' % page)
                 self.add_to_index(page, soup)
 
                 links = soup('a')
@@ -128,6 +131,37 @@ class Crawler:
         self.con.execute('create index urltoidx on link(toid)')
         self.con.execute('create index urlfromidx on link(fromid)')
         self.dbcommit()
+
+    def calculate_pagerank(self, iterations=20):
+        """计算page的pagerank"""
+        # 清除当前的PageRank表
+        self.con.execute('drop table if exists pagerank')
+        self.con.execute('create table pagerank(urlid primary key, score)')
+
+        # 初始化每个url，令其PageRank值为1
+        self.con.execute('insert into pagerank select rowid, 1.0 from urllist')
+        self.dbcommit()
+
+        for i in range(iterations):
+            print("Iteration %d" % i)
+            for (urlid,) in self.con.execute('select rowid from urllist'):
+                pr = 0.15
+
+                # 循环遍历指向当前网页的所有其他网页
+                for (linker,) in self.con.execute(
+                    "select distinct fromid from link where toid=%d" % urlid):
+                    # 得到链接源对应网页的PageRank值
+                    linking_pr = self.con.execute(
+                        "select score from pagerank where urlid=%d" \
+                                            % linker).fetchone()[0]
+                    # 根据链接源，求得总的链接数
+                    linking_count = self.con.execute(
+                            "select count(*) from link where fromid=%d" \
+                                            % linker).fetchoe()[0]
+                    pr += 0.85 * (linking_pr/linking_count)
+                self.con.execute(
+                   "update pagerank set score=%f where urlid=%d" % (pr, urlid))
+            self.dbcommit()
 
 
 class Searcher:
@@ -188,9 +222,11 @@ class Searcher:
 
         # 此处是稍后放置评价函数的地方
         weights = [
-            (1.5, self.frequency_score(rows)),
+            (1.0, self.frequency_score(rows)),
             (1.0, self.location_score(rows)),
-            (1.5, self.distance_score(rows)),
+            (1.0, self.distance_score(rows)),
+            (1.0, self.inboundlink_score(rows)),
+            (1.0, self.pagerank_score(rows)),
         ]
 
         for weight, scores in weights:
@@ -231,7 +267,7 @@ class Searcher:
 
     def frequency_score(self, rows):
         """
-        rows的形式为[[urlid, location1, location3, ...], ...]
+        根据词频对每个网页进行打分，词频越大分值越高
         """
         counts = defaultdict(int)
         for row in rows:
@@ -240,7 +276,7 @@ class Searcher:
 
     def location_score(self, rows):
         """
-        rows的形式为[[urlid, location1, location3, ...], ...]
+        根据词在网页中出现的位置对网页进行打分，越靠前分值越高
         """
         locations = {row[0]:100000 for row in rows}
         for row in rows:
@@ -251,7 +287,7 @@ class Searcher:
 
     def distance_score(self, rows):
         """
-        rows的形式为[[urlid, location1, location3, ...], ...]
+        根据词与词之间的距离对网页进行打分，距离越小分值越高
         """
         # 如果仅有一个单词，则得分都一样
         if len(rows[0]) <= 2:
@@ -264,3 +300,27 @@ class Searcher:
             if dist < mindistance[row[0]]:
                 mindistance[row[0]] = dist
         return self.normalize_scores(mindistance, smallIsBetter=True)
+
+    def inboundlink_score(self, rows):
+        """
+        根据指向自己的链接数对网页进行打分，链接数越大分值越高
+        """
+        uniqueurls = set([row[0] for row in rows])
+        inboundcount = {u:self.con.execute(
+            "select count(*) from link where toid=%d" % u).fetchone()[0] \
+            for u in uniqueurls}
+        return self.normalize_scores(inboundcount)
+
+    def pagerank_score(self, rows):
+        """
+        根据网页的PageRank值对网页进行打分
+        """
+        pageranks = {}
+        for row in rows:
+            score = self.con.execute(
+                    'select score from pagerank where urlid=%d' \
+                            % row[0]).fetchone()[0]
+            pageranks[row[0]] = score
+        maxrank = max(pageranks.values())
+        normalize_scores = {u:float(l)/maxrank for u,l in pageranks.items()}
+        return normalize_scores
