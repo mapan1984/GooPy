@@ -1,5 +1,6 @@
 import re
 import sqlite3 as sqlite
+from operator import itemgetter
 from collections import defaultdict
 from urllib.request import urlopen, urljoin
 
@@ -68,7 +69,7 @@ class Crawler:
 
     # 根据任何非空白字符进行分词处理
     def separate_words(self, text):
-        splitter = re.compile('\\W*')
+        splitter = re.compile(r'\W*')
         return [s.lower() for s in splitter.split(text) if s != '']
 
     # 如果url已经建立过索引，则返回ture
@@ -84,8 +85,22 @@ class Crawler:
 
     # 添加一个关联两个网页的链接
     def add_linkref(self, urlFrom, urlTo, linkText):
-        self.con.execute("insert into link(fromid, toid) values('%s', '%s')" \
-                                                            % (urlFrom, urlTo))
+        words = self.separate_words(linkText)
+        fromid = self.get_entryid('urllist', 'url', urlFrom)
+        toid = self.get_entryid('urllist', 'url', urlTo)
+        if fromid == toid:
+            return
+        cur = self.con.execute(
+                "insert into link(fromid, toid) values('%d', '%d')" \
+                                                    % (fromid, toid))
+        linkid = cur.lastrowid
+        for word in words:
+            if word in ignorewords:
+                continue
+            wordid = self.get_entryid('wordlist', 'word', word)
+            self.con.execute(
+                "insert into linkwords(linkid, wordid) values(%d, %d)" \
+                                                           % (linkid, wordid))
 
     # 从一小组网页开始进行广度优先搜索，直至某一给定深度
     # 期间为网页建立索引
@@ -102,7 +117,8 @@ class Crawler:
                     soup = BeautifulSoup(c.read(), 'html.parser')
                 except:
                     print('Could not read %s' % page)
-                self.add_to_index(page, soup)
+                else:
+                    self.add_to_index(page, soup)
 
                 links = soup('a')
                 for link in links:
@@ -157,7 +173,7 @@ class Crawler:
                     # 根据链接源，求得总的链接数
                     linking_count = self.con.execute(
                             "select count(*) from link where fromid=%d" \
-                                            % linker).fetchoe()[0]
+                                            % linker).fetchone()[0]
                     pr += 0.85 * (linking_pr/linking_count)
                 self.con.execute(
                    "update pagerank set score=%f where urlid=%d" % (pr, urlid))
@@ -189,7 +205,7 @@ class Searcher:
         wordids = []
 
         # 根据空格拆分单词
-        words = q.split(' ')
+        words = q.lower().split(' ')
         table_number = 0
 
         for word in words:
@@ -227,6 +243,7 @@ class Searcher:
             (1.0, self.distance_score(rows)),
             (1.0, self.inboundlink_score(rows)),
             (1.0, self.pagerank_score(rows)),
+            (1.0, self.linktext_score(rows, wordids)),
         ]
 
         for weight, scores in weights:
@@ -242,9 +259,8 @@ class Searcher:
     def query(self, q):
         rows, wordids = self.get_match_rows(q)
         scores = self.get_scored_list(rows, wordids)
-        ranked_scores = sorted([(score, url) for url,score in scores.items()],
-                               reverse=True)
-        for score, urlid in ranked_scores[0:10]:
+        ranked_scores = sorted(scores.items(), key=itemgetter(1), reverse=True)
+        for urlid, score in ranked_scores[0:10]:
             print("%f\t%s" % (score, self.get_url_name(urlid)))
 
     def normalize_scores(self, scores, smallIsBetter=False):
@@ -321,6 +337,23 @@ class Searcher:
                     'select score from pagerank where urlid=%d' \
                             % row[0]).fetchone()[0]
             pageranks[row[0]] = score
-        maxrank = max(pageranks.values())
-        normalize_scores = {u:float(l)/maxrank for u,l in pageranks.items()}
-        return normalize_scores
+        return self.normalize_scores(pageranks)
+
+    def linktext_score(self, rows, wordids):
+        """
+        如果指向网页的链接包含索搜词，
+        那么将指向这个网页的网页的PageRank值作为评价值
+        """
+        linkscores = {row[0]:0 for row in rows}
+        for wordid in wordids:
+            cur = self.con.execute(
+                    "select link.fromid, link.toid from linkwords, link \
+                     where linkwords.wordid=%d and linkwords.linkid=link.rowid" % wordid)
+            # toid 包含搜索词
+            for (fromid, toid) in cur:
+                if toid in wordids:
+                    pr = self.con.execute(
+                            "select score from pagerank where urlid=%d" \
+                                    % fromid).fetchone()[0]
+                    linkscores[toid] += pr
+        return self.normalize_scores(linkscores)
